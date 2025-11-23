@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-dotenv
+openai
+gTTS
+moviepy
+jinja2
+pydantic
+numpy
+pillow
