@@ -1,4 +1,4 @@
-fastapi
+﻿fastapi
 uvicorn
 python-dotenv
 openai
@@ -8,3 +8,8 @@ jinja2
 pydantic
 numpy
 pillow
+diffusers
+transformers
+accelerate
+safetensors
+torch

@@ -2,9 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import random
+import re
 import textwrap
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Sequence
 from uuid import uuid4
 
 import numpy as np
@@ -14,10 +16,12 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from gtts import gTTS
-from moviepy import AudioFileClip, ImageClip, concatenate_videoclips
+from moviepy import AudioFileClip, ImageClip, VideoFileClip, concatenate_videoclips
 from openai import OpenAI
 from pydantic import BaseModel
 from PIL import Image, ImageDraw, ImageFont
+
+from video_generation import VideoGenerator
 
 load_dotenv()
 
@@ -27,6 +31,9 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 MEDIA_DIR = BASE_DIR / "media"
 MEDIA_DIR.mkdir(exist_ok=True)
+
+VIDEO_BACKEND = os.getenv("VIDEO_GENERATOR", "slides")
+video_generator = VideoGenerator(media_dir=MEDIA_DIR, backend=VIDEO_BACKEND)
 
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
@@ -41,6 +48,16 @@ app = FastAPI(title="ChildEdu Prototype")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+
+@app.on_event("startup")
+async def _startup_video_backend() -> None:
+    await _run_in_thread(video_generator.startup)
+
+
+@app.on_event("shutdown")
+async def _shutdown_video_backend() -> None:
+    video_generator.shutdown()
 
 
 class LessonRequest(BaseModel):
@@ -60,6 +77,68 @@ def _get_font(size: int) -> ImageFont.ImageFont:
         return ImageFont.load_default()
 
 
+
+def _normalize_keyword_list(value) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        candidates = re.split(r"[,/|]", value)
+    elif isinstance(value, (list, tuple, set)):
+        candidates = value
+    else:
+        return []
+    keywords: List[str] = []
+    for candidate in candidates:
+        text = str(candidate).strip().lower()
+        if text:
+            keywords.append(text)
+    return keywords
+
+
+
+def _coerce_visual_hints(raw_hints) -> List[Dict[str, object]]:
+    if not raw_hints:
+        return []
+    if isinstance(raw_hints, dict):
+        nested = (
+            raw_hints.get("items")
+            or raw_hints.get("steps")
+            or raw_hints.get("segments")
+            or list(raw_hints.values())
+        )
+        if nested:
+            return _coerce_visual_hints(nested)
+    if not isinstance(raw_hints, list):
+        return []
+
+    hints: List[Dict[str, object]] = []
+    for entry in raw_hints:
+        if isinstance(entry, dict):
+            title = str(
+                entry.get("title")
+                or entry.get("label")
+                or entry.get("name")
+                or entry.get("step")
+                or ""
+            ).strip()
+            prompt = str(
+                entry.get("visual_prompt")
+                or entry.get("prompt")
+                or entry.get("text")
+                or entry.get("summary")
+                or title
+            ).strip()
+            keywords = _normalize_keyword_list(
+                entry.get("keywords") or entry.get("tags") or entry.get("theme")
+            )
+            hints.append({"title": title, "visual_prompt": prompt, "keywords": keywords})
+        elif isinstance(entry, str):
+            text_entry = entry.strip()
+            if text_entry:
+                hints.append({"title": text_entry, "visual_prompt": text_entry, "keywords": []})
+    return hints
+
+
 def _generate_plan_and_contexts(grade: str, topic: str) -> dict:
     if not client:
         raise RuntimeError("OpenAI client is not configured.")
@@ -74,9 +153,9 @@ def _generate_plan_and_contexts(grade: str, topic: str) -> dict:
                 "content": (
                     "You design engaging lesson plans for kids. Produce a JSON object with the keys: "
                     "plan_overview (string, 2 sentences), learning_steps (array of 3-5 short steps), "
-                    "audio_script (friendly narration ~170 words), and video_sections (array of 3-6 "
-                    "short titles or sentences to show on screen). Make sure steps and sections are "
-                    "age appropriate and easy to read."
+                    "audio_script (friendly narration ~170 words), video_sections (array of 3-6 short titles), "
+                    "and visual_hints (array of 3-6 objects with title, visual_prompt, keywords describing the scene). "
+                    "Make sure steps and sections are age appropriate and easy to read."
                 ),
             },
             {
@@ -98,6 +177,14 @@ def _generate_plan_and_contexts(grade: str, topic: str) -> dict:
     audio_script = payload.get("audio_script")
     learning_steps = payload.get("learning_steps") or []
     video_sections = payload.get("video_sections") or []
+    raw_visual_hints = (
+        payload.get("visual_hints")
+        or payload.get("visualSections")
+        or payload.get("visual_prompts")
+        or payload.get("visualPrompts")
+        or []
+    )
+    visual_hints = _coerce_visual_hints(raw_visual_hints)
 
     if not plan_overview or not audio_script:
         raise RuntimeError("Plan overview or audio script missing from AI response.")
@@ -126,20 +213,91 @@ def _generate_plan_and_contexts(grade: str, topic: str) -> dict:
         "learning_steps": learning_steps,
         "audio_script": audio_script.strip(),
         "video_sections": video_sections[:6],
+        "visual_hints": visual_hints[:6],
     }
+
+THEME_KEYWORDS = {
+    "space": {"space", "planet", "moon", "star", "galaxy", "rocket"},
+    "nature": {"nature", "tree", "forest", "flower", "garden", "earth", "soil", "seed", "plant"},
+    "ocean": {"ocean", "sea", "water", "river", "fish", "wave"},
+    "math": {"math", "number", "count", "shape", "geometry", "fraction", "add", "plus", "sum"},
+    "animals": {"animal", "dog", "cat", "lion", "bear", "bird", "dinosaur", "bug"},
+    "story": {"story", "book", "read", "write", "character", "adventure"},
+}
+
+THEME_BACKGROUNDS = {
+    "space": (18, 24, 55),
+    "nature": (186, 232, 198),
+    "ocean": (138, 204, 255),
+    "math": (238, 232, 255),
+    "animals": (255, 236, 214),
+    "story": (255, 247, 226),
+    "default": (233, 244, 255),
+}
+
+
+def _detect_theme(text: str) -> str:
+    normalized = text.lower()
+    for theme, keywords in THEME_KEYWORDS.items():
+        if any(word in normalized for word in keywords):
+            return theme
+    if re.search(r"\d", normalized):
+        return "math"
+    return "default"
+
+
+def _draw_theme_scene(draw: ImageDraw.ImageDraw, theme: str, width: int, height: int, rng: random.Random) -> None:
+    if theme == "space":
+        for _ in range(30):
+            x = rng.randint(20, width - 20)
+            y = rng.randint(20, int(height * 0.7))
+            radius = rng.randint(1, 4)
+            draw.ellipse((x, y, x + radius, y + radius), fill=(255, 255, 210))
+        planet_radius = 120
+        center_x = width - 260
+        center_y = int(height * 0.4)
+        draw.ellipse((center_x - planet_radius, center_y - planet_radius, center_x + planet_radius, center_y + planet_radius), fill=(90, 130, 255), outline=(200, 210, 255), width=6)
+    elif theme == "nature":
+        horizon = int(height * 0.7)
+        draw.rectangle((0, horizon, width, height), fill=(140, 210, 140))
+        sun_radius = 60
+        draw.ellipse((width - 220, 60, width - 220 + sun_radius * 2, 60 + sun_radius * 2), fill=(255, 223, 128))
+    elif theme == "ocean":
+        wave_top = int(height * 0.45)
+        draw.rectangle((0, wave_top, width, height), fill=(20, 120, 210))
+        for wave in range(5):
+            y = wave_top + wave * 45
+            draw.arc((40, y, width - 40, y + 90), start=0, end=180, fill=(255, 255, 255), width=2)
+    elif theme == "math":
+        draw.rectangle((80, 160, width - 80, height - 200), outline=(200, 210, 235), width=4)
+        draw.text((140, 200), "1 + 2 = 3", fill=(80, 60, 160), font=_get_font(58))
+        draw.text((140, 300), "7 - 4 = 3", fill=(30, 130, 150), font=_get_font(52))
+    elif theme == "animals":
+        meadow = int(height * 0.7)
+        draw.rectangle((0, meadow, width, height), fill=(190, 235, 190))
+    elif theme == "story":
+        table = int(height * 0.7)
+        draw.rectangle((0, table, width, height), fill=(205, 170, 125))
+    else:
+        draw.rectangle((0, height - 180, width, height), fill=(205, 180, 150))
+
 
 def _render_slide_frame(text: str, highlight: bool = False) -> np.ndarray:
     width, height = 1280, 720
-    background = (168, 210, 255) if highlight else (235, 243, 255)
+    cleaned = text or "Learning Time"
+    theme = _detect_theme(cleaned)
+    background = THEME_BACKGROUNDS.get(theme, THEME_BACKGROUNDS["default"])
     image = Image.new("RGB", (width, height), color=background)
     draw = ImageDraw.Draw(image)
+    rng = random.Random(hash(cleaned) & 0xFFFFFFFF)
+    _draw_theme_scene(draw, theme, width, height, rng)
 
     font_size = 58 if highlight else 42
     font = _get_font(font_size)
     wrap_width = 18 if highlight else 26
 
     paragraphs: List[str] = []
-    for paragraph in text.split("\n"):
+    for paragraph in cleaned.split("\n"):
         paragraph = paragraph.strip()
         if not paragraph:
             continue
@@ -265,3 +423,6 @@ async def generate_lesson(payload: LessonRequest):
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"ok": False, "error": exc.detail})
+
+
+

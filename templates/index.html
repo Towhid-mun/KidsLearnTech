@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Learning Video for Kids</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <main class="container">
+        <h1>AI Learning Video for Kids</h1>
+        <p class="tagline">Plan a lesson, generate audio + video, and watch it instantly.</p>
+        <div class="form-grid">
+            <label>
+                <span>Child grade</span>
+                <input id="grade-input" type="text" placeholder="e.g., 4th grade" />
+            </label>
+            <label>
+                <span>What should we learn?</span>
+                <input id="topic-input" type="text" placeholder="e.g., Fractions basics" />
+            </label>
+            <button id="generate-btn">Generate Lesson</button>
+        </div>
+        <div id="status" role="status">Enter a grade and topic to get started.</div>
+        <section id="result" class="hidden">
+            <section class="card" id="plan-section">
+                <h2>Learning Plan</h2>
+                <p id="plan-overview"></p>
+                <ul id="plan-steps"></ul>
+            </section>
+            <section class="card" id="audio-section">
+                <div class="card-header">
+                    <h2>Audio Script</h2>
+                    <small>Used for text-to-speech</small>
+                </div>
+                <pre id="audio-script"></pre>
+            </section>
+            <section class="card" id="video-section">
+                <div class="card-header">
+                    <h2>Video Slides</h2>
+                    <small>Used to render visuals</small>
+                </div>
+                <ul id="video-notes"></ul>
+            </section>
+            <section class="card">
+                <h2>Lesson Video</h2>
+                <video id="lesson-video" controls></video>
+            </section>
+        </section>
+    </main>
+    <script src="/static/main.js" defer></script>
+</body>
+</html>
